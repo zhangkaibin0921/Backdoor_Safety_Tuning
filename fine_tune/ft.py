@@ -41,6 +41,147 @@ class LabelSmoothingLoss(nn.Module):
         return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
 
 
+def compute_fisher_information(model, dataloader, device, criterion):
+    """
+    Compute Fisher Information for each parameter in the model.
+    Fisher Information I_w = E[(dL/dw)^2] approximates the importance of each parameter.
+    """
+    model.eval()
+    fisher_dict = {}
+    
+    # Initialize fisher dict with zeros
+    for name, param in model.named_parameters():
+        fisher_dict[name] = torch.zeros_like(param.data)
+    
+    num_samples = 0
+    for batch_idx, (x, labels, *additional_info) in enumerate(dataloader):
+        x, labels = x.to(device), labels.to(device)
+        model.zero_grad()
+        
+        output = model(x)
+        loss = criterion(output, labels.long())
+        loss.backward()
+        
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                fisher_dict[name] += param.grad.data.pow(2) * x.size(0)
+        
+        num_samples += x.size(0)
+    
+    # Average over all samples
+    for name in fisher_dict:
+        fisher_dict[name] /= num_samples
+    
+    return fisher_dict
+
+
+def generate_zone_masks(model, fisher_dict, top_ratio=0.3, bottom_ratio=0.3):
+    """
+    Generate three masks based on Fisher Information scores:
+    - M_freeze: Top `top_ratio` parameters (Anchor Zone)
+    - M_perturb: Middle parameters (Perturbation Zone)  
+    - M_reset: Bottom `bottom_ratio` parameters (Purge Zone)
+    """
+    # Flatten all Fisher scores
+    all_fisher_scores = []
+    param_info = []  # Store (name, flat_idx_start, flat_idx_end, shape)
+    
+    flat_idx = 0
+    for name, param in model.named_parameters():
+        fisher_flat = fisher_dict[name].flatten()
+        all_fisher_scores.append(fisher_flat)
+        param_info.append((name, flat_idx, flat_idx + fisher_flat.numel(), param.shape))
+        flat_idx += fisher_flat.numel()
+    
+    all_fisher_scores = torch.cat(all_fisher_scores)
+    total_params = all_fisher_scores.numel()
+    
+    # Sort Fisher scores and find thresholds
+    sorted_scores, _ = torch.sort(all_fisher_scores)
+    
+    bottom_threshold_idx = int(total_params * bottom_ratio)
+    top_threshold_idx = int(total_params * (1 - top_ratio))
+    
+    bottom_threshold = sorted_scores[bottom_threshold_idx].item() if bottom_threshold_idx < total_params else float('inf')
+    top_threshold = sorted_scores[top_threshold_idx].item() if top_threshold_idx < total_params else float('inf')
+    
+    # Generate masks for each parameter
+    mask_freeze = {}
+    mask_perturb = {}
+    mask_reset = {}
+    
+    for name, param in model.named_parameters():
+        fisher_scores = fisher_dict[name]
+        
+        # Top zone (freeze): Fisher >= top_threshold
+        mask_freeze[name] = (fisher_scores >= top_threshold).float()
+        
+        # Bottom zone (reset): Fisher <= bottom_threshold
+        mask_reset[name] = (fisher_scores <= bottom_threshold).float()
+        
+        # Middle zone (perturb): Everything else
+        mask_perturb[name] = ((fisher_scores > bottom_threshold) & (fisher_scores < top_threshold)).float()
+    
+    return mask_freeze, mask_perturb, mask_reset
+
+
+def apply_zone_initialization(model, mask_freeze, mask_perturb, mask_reset, sigma=0.1):
+    """
+    Apply mixed initialization based on zone masks:
+    - Anchor Zone (freeze): Keep original weights
+    - Perturbation Zone (perturb): Add Gaussian noise
+    - Purge Zone (reset): Re-initialize with Kaiming/Xavier
+    """
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            original_weight = param.data.clone()
+            
+            # Generate noise for perturbation zone
+            noise = torch.randn_like(param.data) * sigma * torch.norm(param.data)
+            perturbed_weight = original_weight + noise
+            
+            # Generate re-initialized weights for reset zone (Kaiming for Conv, Xavier for Linear)
+            reset_weight = torch.zeros_like(param.data)
+            if 'weight' in name:
+                if len(param.shape) >= 2:
+                    # Kaiming initialization for conv/linear weights
+                    nn.init.kaiming_uniform_(reset_weight, a=math.sqrt(5))
+                else:
+                    # For 1D weights (like BN), use uniform
+                    fan_in = param.shape[0]
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    nn.init.uniform_(reset_weight, -bound, bound)
+            elif 'bias' in name:
+                fan_in = param.shape[0]
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                nn.init.uniform_(reset_weight, -bound, bound)
+            
+            # Combine: w_new = w_old * M_freeze + (w_old + noise) * M_perturb + init() * M_reset
+            param.data = (original_weight * mask_freeze[name] + 
+                         perturbed_weight * mask_perturb[name] + 
+                         reset_weight * mask_reset[name])
+
+
+def compute_parameter_consistency_loss(model, teacher_model, mask_perturb):
+    """
+    Compute L2 loss between student and teacher parameters in the perturbation zone.
+    Only constrains parameters that were perturbed (Middle Zone).
+    
+    L_param = sum_{w in Middle Zone} ||w - w^T0||_2^2
+    
+    This prevents the perturbed neurons from deviating too far from the original,
+    helping them recover benign features while disrupting backdoor patterns.
+    """
+    param_loss = 0.0
+    for name, param in model.named_parameters():
+        if name in mask_perturb:
+            teacher_param = teacher_model.state_dict()[name]
+            # Only compute loss for parameters in perturbation zone (mask_perturb == 1)
+            diff = (param - teacher_param) * mask_perturb[name]
+            param_loss += torch.sum(diff ** 2)
+    return param_loss
+
+
 def add_args(parser):
     """
     parser : argparse.ArgumentParser
@@ -81,6 +222,12 @@ def add_args(parser):
     parser.add_argument('--linear_name', type=str, default='linear', help='name for the linear classifier')
     parser.add_argument('--lb_smooth', type=float, default=None, help='label smoothing')
     parser.add_argument('--alpha', type=float, default=0.2, help='fst')
+    
+    # Arguments for fzp (Fisher Zone Purification) mode
+    parser.add_argument('--fzp_sigma', type=float, default=0.1, help='noise scale for perturbation zone in fzp')
+    parser.add_argument('--fzp_lambda', type=float, default=0.01, help='weight for parameter consistency loss in fzp (L2 regularization on perturbed zone)')
+    parser.add_argument('--fzp_top_ratio', type=float, default=0.3, help='top ratio for anchor zone (freeze)')
+    parser.add_argument('--fzp_bottom_ratio', type=float, default=0.3, help='bottom ratio for purge zone (reset)')
     return parser
 
 def main():
@@ -111,6 +258,9 @@ def main():
     elif args.ft_mode == 'fst':
         assert args.alpha is not None
         init = True
+    elif args.ft_mode == 'fzp':
+        # Fisher Zone Purification - special initialization handled separately
+        init = False  # Will be handled by zone-based initialization
     else:
         raise NotImplementedError('Not implemented method.')
 
@@ -264,6 +414,61 @@ def main():
     original_linear_norm = torch.norm(eval(f'net.{args.linear_name}.weight'))
     weight_mat_ori = eval(f'net.{args.linear_name}.weight.data.clone().detach()')
 
+    # FZP (Fisher Zone Purification) specific initialization
+    teacher_model = None
+    mask_freeze = None
+    mask_perturb = None
+    
+    if args.ft_mode == 'fzp':
+        import copy
+        logging.info('='*50)
+        logging.info('Fisher Zone Purification (FZP) Mode')
+        logging.info('='*50)
+        
+        # Step 1: Create teacher model (frozen copy of original model)
+        logging.info('Step 1: Creating teacher model (frozen copy for parameter consistency)...')
+        teacher_model = copy.deepcopy(net)
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+        
+        # Step 2: Compute Fisher Information using 5% clean data
+        logging.info('Step 2: Computing Fisher Information for all parameters...')
+        fisher_criterion = nn.CrossEntropyLoss()
+        fisher_dict = compute_fisher_information(net, train_data, device, fisher_criterion)
+        
+        # Log Fisher statistics
+        total_fisher = sum(f.sum().item() for f in fisher_dict.values())
+        logging.info(f'Total Fisher Information: {total_fisher:.6f}')
+        
+        # Step 3: Generate zone masks based on Fisher scores
+        logging.info(f'Step 3: Generating zone masks (Top {args.fzp_top_ratio*100:.0f}% freeze, '
+                    f'Middle {(1-args.fzp_top_ratio-args.fzp_bottom_ratio)*100:.0f}% perturb, '
+                    f'Bottom {args.fzp_bottom_ratio*100:.0f}% reset)...')
+        mask_freeze, mask_perturb, mask_reset = generate_zone_masks(
+            net, fisher_dict, 
+            top_ratio=args.fzp_top_ratio, 
+            bottom_ratio=args.fzp_bottom_ratio
+        )
+        
+        # Log zone statistics
+        total_params = sum(p.numel() for p in net.parameters())
+        freeze_count = sum(m.sum().item() for m in mask_freeze.values())
+        perturb_count = sum(m.sum().item() for m in mask_perturb.values())
+        reset_count = sum(m.sum().item() for m in mask_reset.values())
+        logging.info(f'Anchor Zone (freeze): {freeze_count:.0f} params ({freeze_count/total_params*100:.1f}%)')
+        logging.info(f'Perturbation Zone (noise): {perturb_count:.0f} params ({perturb_count/total_params*100:.1f}%)')
+        logging.info(f'Purge Zone (reset): {reset_count:.0f} params ({reset_count/total_params*100:.1f}%)')
+        
+        # Step 4: Apply mixed initialization
+        logging.info(f'Step 4: Applying mixed initialization (sigma={args.fzp_sigma})...')
+        apply_zone_initialization(net, mask_freeze, mask_perturb, mask_reset, sigma=args.fzp_sigma)
+        
+        logging.info('='*50)
+        logging.info('FZP initialization complete. Starting recovery tuning...')
+        logging.info(f'Parameter consistency regularization: lambda={args.fzp_lambda}')
+        logging.info('='*50)
+
     param_list = []
     for name, param in net.named_parameters():
         if args.linear_name in name:
@@ -291,6 +496,15 @@ def main():
                 param_list.append(param)
             else:
                 param.requires_grad = False
+        elif args.ft_mode == 'fzp':
+            # For FZP: freeze anchor zone, allow updates for perturb and reset zones
+            if mask_freeze is not None and mask_freeze[name].sum() == mask_freeze[name].numel():
+                # Fully frozen parameter (all in anchor zone)
+                param.requires_grad = False
+            else:
+                # Has some trainable parameters
+                param.requires_grad = True
+                param_list.append(param)
         
         
 
@@ -318,10 +532,32 @@ def main():
             else:
                 if args.ft_mode == 'fst':
                     loss = torch.sum(eval(f'net.{args.linear_name}.weight') * weight_mat_ori)*args.alpha + criterion(log_probs, labels.long())
+                elif args.ft_mode == 'fzp':
+                    # FZP: CE loss + Parameter Consistency Regularization
+                    ce_loss = criterion(log_probs, labels.long())
+                    
+                    # Compute parameter consistency loss for perturbation zone
+                    # This prevents perturbed neurons from deviating too far from teacher
+                    param_loss = torch.tensor(0.0, device=device)
+                    if teacher_model is not None and mask_perturb is not None:
+                        param_loss = compute_parameter_consistency_loss(net, teacher_model, mask_perturb)
+                    
+                    loss = ce_loss + args.fzp_lambda * param_loss
+                    
+                    # Log losses periodically
+                    if batch_idx % 50 == 0:
+                        logging.debug(f'Batch {batch_idx}: CE={ce_loss.item():.4f}, ParamLoss={param_loss.item():.4f}')
                 else:
                     loss = criterion(log_probs, labels.long())
             loss.backward()
             
+            # For FZP: Apply gradient masking to respect zone boundaries
+            if args.ft_mode == 'fzp' and mask_freeze is not None:
+                with torch.no_grad():
+                    for name, param in net.named_parameters():
+                        if param.grad is not None and name in mask_freeze:
+                            # Zero out gradients for frozen (anchor zone) parameters
+                            param.grad.data *= (1 - mask_freeze[name])
             
             optimizer.step()
             optimizer.zero_grad()
