@@ -133,20 +133,24 @@ def generate_zone_masks(model, fisher_dict, top_ratio=0.3, bottom_ratio=0.3, lin
     return mask_freeze, mask_perturb, mask_reset
 
 
-def apply_zone_initialization(model, mask_freeze, mask_perturb, mask_reset, sigma=0.1):
+def apply_zone_initialization(model, mask_freeze, mask_perturb, mask_reset, sigma=0.1, add_noise=True):
     """
     Apply mixed initialization based on zone masks:
     - Anchor Zone (freeze): Keep original weights
-    - Perturbation Zone (perturb): Add Gaussian noise
+    - Perturbation Zone (perturb): Add Gaussian noise if add_noise=True, otherwise keep original
     - Purge Zone (reset): Re-initialize with Kaiming/Xavier
     """
     with torch.no_grad():
         for name, param in model.named_parameters():
             original_weight = param.data.clone()
             
-            # Generate noise for perturbation zone
-            noise = torch.randn_like(param.data) * sigma * torch.norm(param.data)
-            perturbed_weight = original_weight + noise
+            # Generate noise for perturbation zone (only if add_noise=True)
+            if add_noise:
+                noise = torch.randn_like(param.data) * sigma * torch.norm(param.data)
+                perturbed_weight = original_weight + noise
+            else:
+                # Without noise, perturbation zone keeps original weights
+                perturbed_weight = original_weight
             
             # Generate re-initialized weights for reset zone (Kaiming for Conv, Xavier for Linear)
             reset_weight = torch.zeros_like(param.data)
@@ -253,6 +257,7 @@ def add_args(parser):
     parser.add_argument('--fzp_lambda', type=float, default=0.01, help='weight for parameter consistency loss in fzp (L2 regularization on perturbed zone)')
     parser.add_argument('--fzp_top_ratio', type=float, default=0.3, help='top ratio for anchor zone (freeze)')
     parser.add_argument('--fzp_bottom_ratio', type=float, default=0.3, help='bottom ratio for purge zone (reset)')
+    parser.add_argument('--fzp_add_noise', action='store_true', help='whether to add noise to perturbation zone (default: False, no noise, normal fine-tuning)')
     return parser
 
 def main():
@@ -487,9 +492,12 @@ def main():
         logging.info(f'Purge Zone (reset): {reset_count:.0f} params ({reset_count/total_params*100:.1f}%)')
         
         # Step 4: Apply mixed initialization
-        logging.info(f'Step 4: Applying mixed initialization (sigma={args.fzp_sigma})...')
+        if args.fzp_add_noise:
+            logging.info(f'Step 4: Applying mixed initialization (sigma={args.fzp_sigma}) with NOISE on perturbation zone...')
+        else:
+            logging.info(f'Step 4: Applying mixed initialization (NO NOISE, normal fine-tuning on perturbation zone)...')
         logging.info(f'Note: Linear classifier ({args.linear_name}) is forced to Purge Zone (fully reset)')
-        apply_zone_initialization(net, mask_freeze, mask_perturb, mask_reset, sigma=args.fzp_sigma)
+        apply_zone_initialization(net, mask_freeze, mask_perturb, mask_reset, sigma=args.fzp_sigma, add_noise=args.fzp_add_noise)
         
         logging.info('='*50)
         logging.info('FZP initialization complete. Starting recovery tuning...')
@@ -560,21 +568,29 @@ def main():
                 if args.ft_mode == 'fst':
                     loss = torch.sum(eval(f'net.{args.linear_name}.weight') * weight_mat_ori)*args.alpha + criterion(log_probs, labels.long())
                 elif args.ft_mode == 'fzp':
-                    # FZP: CE loss + Parameter Consistency Regularization
+                    # FZP: CE loss + Parameter Consistency Regularization (only if noise is added)
                     ce_loss = criterion(log_probs, labels.long())
+                    param_loss = torch.tensor(0.0, device=device)  # Initialize to avoid scope issues
                     
-                    # Compute parameter consistency loss for perturbation zone
-                    # This prevents perturbed neurons from deviating too far from teacher
-                    # Note: Linear classifier is excluded (fully re-initialized)
-                    param_loss = torch.tensor(0.0, device=device)
-                    if teacher_model is not None and mask_perturb is not None:
-                        param_loss = compute_parameter_consistency_loss(net, teacher_model, mask_perturb, args.linear_name)
-                    
-                    loss = ce_loss + args.fzp_lambda * param_loss
-                    
-                    # Log losses periodically
-                    if batch_idx % 50 == 0:
-                        logging.debug(f'Batch {batch_idx}: CE={ce_loss.item():.4f}, ParamLoss={param_loss.item():.4f}, Total={loss.item():.4f}')
+                    if args.fzp_add_noise:
+                        # Compute parameter consistency loss for perturbation zone (only when noise is added)
+                        # This prevents perturbed neurons from deviating too far from teacher
+                        # Note: Linear classifier is excluded (fully re-initialized)
+                        if teacher_model is not None and mask_perturb is not None:
+                            param_loss = compute_parameter_consistency_loss(net, teacher_model, mask_perturb, args.linear_name)
+                        
+                        loss = ce_loss + args.fzp_lambda * param_loss
+                        
+                        # Log losses periodically
+                        if batch_idx % 50 == 0:
+                            logging.debug(f'Batch {batch_idx}: CE={ce_loss.item():.4f}, ParamLoss={param_loss.item():.4f}, Total={loss.item():.4f}')
+                    else:
+                        # Without noise, just use CE loss (normal fine-tuning)
+                        loss = ce_loss
+                        
+                        # Log losses periodically
+                        if batch_idx % 50 == 0:
+                            logging.debug(f'Batch {batch_idx}: CE={ce_loss.item():.4f}, Total={loss.item():.4f}')
                 else:
                     loss = criterion(log_probs, labels.long())
             loss.backward()
@@ -605,7 +621,12 @@ def main():
                     ce_loss_list = []
                     param_loss_list = []
                 ce_loss_list.append(ce_loss.item() * labels.size(0))
-                param_loss_list.append(param_loss.item() * labels.size(0))
+                if args.fzp_add_noise:
+                    # Track param_loss when noise is added
+                    param_loss_list.append(param_loss.item() * labels.size(0))
+                else:
+                    # No param_loss when no noise is added
+                    param_loss_list.append(0.0)
 
     
         scheduler.step()
@@ -614,9 +635,12 @@ def main():
         # For FZP: report loss breakdown
         if args.ft_mode == 'fzp' and 'ce_loss_list' in locals():
             avg_ce_loss = sum(ce_loss_list) / train_tot
-            avg_param_loss = sum(param_loss_list) / train_tot
             avg_total_loss = one_epoch_loss / train_tot
-            logging.info(f'Training ACC: {train_correct/train_tot} | Total loss: {avg_total_loss:.4f} (CE: {avg_ce_loss:.4f}, Param: {avg_param_loss:.4f})')
+            if args.fzp_add_noise:
+                avg_param_loss = sum(param_loss_list) / train_tot if len(param_loss_list) > 0 else 0.0
+                logging.info(f'Training ACC: {train_correct/train_tot} | Total loss: {avg_total_loss:.4f} (CE: {avg_ce_loss:.4f}, Param: {avg_param_loss:.4f})')
+            else:
+                logging.info(f'Training ACC: {train_correct/train_tot} | Total loss: {avg_total_loss:.4f} (CE: {avg_ce_loss:.4f}, No Param Loss)')
         else:
             avg_total_loss = one_epoch_loss / train_tot
             logging.info(f'Training ACC: {train_correct/train_tot} | Training loss: {avg_total_loss:.4f}')
