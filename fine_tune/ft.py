@@ -75,12 +75,14 @@ def compute_fisher_information(model, dataloader, device, criterion):
     return fisher_dict
 
 
-def generate_zone_masks(model, fisher_dict, top_ratio=0.3, bottom_ratio=0.3):
+def generate_zone_masks(model, fisher_dict, top_ratio=0.3, bottom_ratio=0.3, linear_name='linear'):
     """
     Generate three masks based on Fisher Information scores:
     - M_freeze: Top `top_ratio` parameters (Anchor Zone)
     - M_perturb: Middle parameters (Perturbation Zone)  
     - M_reset: Bottom `bottom_ratio` parameters (Purge Zone)
+    
+    Note: Linear classifier layer is forced to Purge Zone (fully reset).
     """
     # Flatten all Fisher scores
     all_fisher_scores = []
@@ -113,14 +115,20 @@ def generate_zone_masks(model, fisher_dict, top_ratio=0.3, bottom_ratio=0.3):
     for name, param in model.named_parameters():
         fisher_scores = fisher_dict[name]
         
-        # Top zone (freeze): Fisher >= top_threshold
-        mask_freeze[name] = (fisher_scores >= top_threshold).float()
-        
-        # Bottom zone (reset): Fisher <= bottom_threshold
-        mask_reset[name] = (fisher_scores <= bottom_threshold).float()
-        
-        # Middle zone (perturb): Everything else
-        mask_perturb[name] = ((fisher_scores > bottom_threshold) & (fisher_scores < top_threshold)).float()
+        # Force linear classifier to Purge Zone (fully reset)
+        if linear_name in name:
+            mask_freeze[name] = torch.zeros_like(fisher_scores).float()
+            mask_perturb[name] = torch.zeros_like(fisher_scores).float()
+            mask_reset[name] = torch.ones_like(fisher_scores).float()
+        else:
+            # Top zone (freeze): Fisher >= top_threshold
+            mask_freeze[name] = (fisher_scores >= top_threshold).float()
+            
+            # Bottom zone (reset): Fisher <= bottom_threshold
+            mask_reset[name] = (fisher_scores <= bottom_threshold).float()
+            
+            # Middle zone (perturb): Everything else
+            mask_perturb[name] = ((fisher_scores > bottom_threshold) & (fisher_scores < top_threshold)).float()
     
     return mask_freeze, mask_perturb, mask_reset
 
@@ -162,18 +170,22 @@ def apply_zone_initialization(model, mask_freeze, mask_perturb, mask_reset, sigm
                          reset_weight * mask_reset[name])
 
 
-def compute_parameter_consistency_loss(model, teacher_model, mask_perturb):
+def compute_parameter_consistency_loss(model, teacher_model, mask_perturb, linear_name='linear'):
     """
     Compute L2 loss between student and teacher parameters in the perturbation zone.
     Only constrains parameters that were perturbed (Middle Zone).
+    Excludes linear classifier layer, which is fully re-initialized.
     
-    L_param = sum_{w in Middle Zone} ||w - w^T0||_2^2
+    L_param = sum_{w in Middle Zone, w not in linear} ||w - w^T0||_2^2
     
     This prevents the perturbed neurons from deviating too far from the original,
     helping them recover benign features while disrupting backdoor patterns.
     """
     param_loss = 0.0
     for name, param in model.named_parameters():
+        # Skip linear classifier layer (fully re-initialized, no constraint needed)
+        if linear_name in name:
+            continue
         if name in mask_perturb:
             teacher_param = teacher_model.state_dict()[name]
             # Only compute loss for parameters in perturbation zone (mask_perturb == 1)
@@ -448,7 +460,8 @@ def main():
         mask_freeze, mask_perturb, mask_reset = generate_zone_masks(
             net, fisher_dict, 
             top_ratio=args.fzp_top_ratio, 
-            bottom_ratio=args.fzp_bottom_ratio
+            bottom_ratio=args.fzp_bottom_ratio,
+            linear_name=args.linear_name
         )
         
         # Log zone statistics
@@ -462,6 +475,7 @@ def main():
         
         # Step 4: Apply mixed initialization
         logging.info(f'Step 4: Applying mixed initialization (sigma={args.fzp_sigma})...')
+        logging.info(f'Note: Linear classifier ({args.linear_name}) is forced to Purge Zone (fully reset)')
         apply_zone_initialization(net, mask_freeze, mask_perturb, mask_reset, sigma=args.fzp_sigma)
         
         logging.info('='*50)
@@ -538,9 +552,10 @@ def main():
                     
                     # Compute parameter consistency loss for perturbation zone
                     # This prevents perturbed neurons from deviating too far from teacher
+                    # Note: Linear classifier is excluded (fully re-initialized)
                     param_loss = torch.tensor(0.0, device=device)
                     if teacher_model is not None and mask_perturb is not None:
-                        param_loss = compute_parameter_consistency_loss(net, teacher_model, mask_perturb)
+                        param_loss = compute_parameter_consistency_loss(net, teacher_model, mask_perturb, args.linear_name)
                     
                     loss = ce_loss + args.fzp_lambda * param_loss
                     
