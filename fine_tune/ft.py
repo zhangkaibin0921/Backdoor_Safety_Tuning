@@ -574,7 +574,7 @@ def main():
                     
                     # Log losses periodically
                     if batch_idx % 50 == 0:
-                        logging.debug(f'Batch {batch_idx}: CE={ce_loss.item():.4f}, ParamLoss={param_loss.item():.4f}')
+                        logging.debug(f'Batch {batch_idx}: CE={ce_loss.item():.4f}, ParamLoss={param_loss.item():.4f}, Total={loss.item():.4f}')
                 else:
                     loss = criterion(log_probs, labels.long())
             loss.backward()
@@ -598,13 +598,28 @@ def main():
             train_tot += labels.size(0)
             batch_loss = loss.item() * labels.size(0)
             batch_loss_list.append(batch_loss)
+            
+            # Track CE and param loss separately for FZP
+            if args.ft_mode == 'fzp':
+                if 'ce_loss_list' not in locals():
+                    ce_loss_list = []
+                    param_loss_list = []
+                ce_loss_list.append(ce_loss.item() * labels.size(0))
+                param_loss_list.append(param_loss.item() * labels.size(0))
 
     
         scheduler.step()
         one_epoch_loss = sum(batch_loss_list)
-
-
-        logging.info(f'Training ACC: {train_correct/train_tot} | Training loss: {one_epoch_loss}')
+        
+        # For FZP: report loss breakdown
+        if args.ft_mode == 'fzp' and 'ce_loss_list' in locals():
+            avg_ce_loss = sum(ce_loss_list) / train_tot
+            avg_param_loss = sum(param_loss_list) / train_tot
+            avg_total_loss = one_epoch_loss / train_tot
+            logging.info(f'Training ACC: {train_correct/train_tot} | Total loss: {avg_total_loss:.4f} (CE: {avg_ce_loss:.4f}, Param: {avg_param_loss:.4f})')
+        else:
+            avg_total_loss = one_epoch_loss / train_tot
+            logging.info(f'Training ACC: {train_correct/train_tot} | Training loss: {avg_total_loss:.4f}')
         logging.info(f'Learning rate: {optimizer.param_groups[0]["lr"]}')
         logging.info('-------------------------------------')
         
