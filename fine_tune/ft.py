@@ -176,12 +176,16 @@ def compute_parameter_consistency_loss(model, teacher_model, mask_perturb, linea
     Only constrains parameters that were perturbed (Middle Zone).
     Excludes linear classifier layer, which is fully re-initialized.
     
-    L_param = sum_{w in Middle Zone, w not in linear} ||w - w^T0||_2^2
+    L_param = mean_{w in Middle Zone, w not in linear} ||w - w^T0||_2^2
     
     This prevents the perturbed neurons from deviating too far from the original,
     helping them recover benign features while disrupting backdoor patterns.
+    
+    Note: Normalized by the number of parameters to prevent numerical overflow.
     """
     param_loss = 0.0
+    total_perturb_params = 0
+    
     for name, param in model.named_parameters():
         # Skip linear classifier layer (fully re-initialized, no constraint needed)
         if linear_name in name:
@@ -191,6 +195,15 @@ def compute_parameter_consistency_loss(model, teacher_model, mask_perturb, linea
             # Only compute loss for parameters in perturbation zone (mask_perturb == 1)
             diff = (param - teacher_param) * mask_perturb[name]
             param_loss += torch.sum(diff ** 2)
+            # Count how many parameters are in perturbation zone
+            total_perturb_params += mask_perturb[name].sum().item()
+    
+    # Normalize by number of parameters to prevent numerical overflow
+    if total_perturb_params > 0:
+        param_loss = param_loss / total_perturb_params
+    else:
+        param_loss = torch.tensor(0.0, device=param_loss.device if isinstance(param_loss, torch.Tensor) else 'cpu')
+    
     return param_loss
 
 
