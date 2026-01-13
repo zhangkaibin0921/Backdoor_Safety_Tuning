@@ -791,7 +791,7 @@ class nad(defense):
                 trainloader,
                 data_clean_loader,
                 data_bd_loader,
-                args.te_epochs,
+                args.epochs,
                 criterions = criterions,
                 optimizer = optimizer,
                 scheduler = scheduler,
