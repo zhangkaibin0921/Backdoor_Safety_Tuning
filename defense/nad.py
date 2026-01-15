@@ -616,6 +616,8 @@ class nad(defense):
         parser.add_argument('--teacher_model_loc', type=str, help='the location of teacher model')
 
         parser.add_argument('--index', type=str, help='index of clean data')
+        
+        parser.add_argument('--init_student_from_scratch', type=lambda x: str(x) in ['True', 'true', '1'], default=False, help='if True, initialize student model from scratch instead of loading from poisoned model')
 
     
 
@@ -705,7 +707,13 @@ class nad(defense):
             teacher.to(self.args.device)
         logging.info('finished teacher student init...')
         student = generate_cls_model(args.model,args.num_classes)
-        student.load_state_dict(result['model'])
+        if not args.init_student_from_scratch:
+            # Load from poisoned model (default behavior)
+            student.load_state_dict(result['model'])
+            logging.info('Student model initialized from poisoned model')
+        else:
+            # Initialize from scratch (random initialization)
+            logging.info('Student model initialized from scratch')
         if "," in self.device:
             student = torch.nn.DataParallel(
                 student,
